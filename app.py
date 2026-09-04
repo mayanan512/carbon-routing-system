@@ -74,6 +74,10 @@ ox.settings.cache_folder = target_cache_dir
 ox.settings.use_cache = True
 ox.settings.log_console = False
 
+# 纯 Python 查找最近节点 (彻底替代 osmnx.nearest_nodes，免除 scipy 依赖)
+def find_nearest_node(G, lon, lat):
+    return min(G.nodes(), key=lambda n: (G.nodes[n]['x'] - float(lon))**2 + (G.nodes[n]['y'] - float(lat))**2)
+
 @st.cache_resource
 def load_city_network(city_name):
     cfg = CITY_CONFIGS.get(city_name, CITY_CONFIGS["北京 (海淀中关村·核心实验区)"])
@@ -100,7 +104,7 @@ def load_city_network(city_name):
     scc = max(nx.strongly_connected_components(G_simple), key=len)
     return G.subgraph(scc).copy()
 
-# 1. 标题与核心立论
+# 1. 竞赛主标题与核心立论
 st.title("🌱 碳路智行：面向城市道路的自适应低碳路径规划系统")
 st.caption("中国研究生“双碳”创新与创意大赛 · 赛道六（低零碳交通）创意设计作品 · 微观物理仿真闭环平台")
 
@@ -179,13 +183,14 @@ show_eco = st.sidebar.checkbox("显示 自适应低碳路线 (绿)", value=True)
 show_short = st.sidebar.checkbox("显示 传统最短路线 (蓝)", value=True)
 show_fast = st.sidebar.checkbox("显示 时间最快路线 (橙)", value=True)
 
-# 4. 真实道路几何轨迹提取
+# 4. 真实道路几何轨迹提取算法 (使用纯 Python 寻点，杜绝 ImportError)
 def get_adaptive_corridor_coords(G: nx.MultiDiGraph, orig_pt, dest_pt, is_peak: bool):
     orig_lat, orig_lon = orig_pt
     dest_lat, dest_lon = dest_pt
 
-    orig_node = ox.distance.nearest_nodes(G, X=float(orig_lon), Y=float(orig_lat))
-    dest_node = ox.distance.nearest_nodes(G, X=float(dest_lon), Y=float(dest_lat))
+    # 【关键修复】：免除 scipy 依赖，纯原生秒级计算
+    orig_node = find_nearest_node(G, orig_lon, orig_lat)
+    dest_node = find_nearest_node(G, dest_lon, dest_lat)
 
     G_base = nx.DiGraph()
     for u, v, data in G.edges(data=True):
@@ -193,11 +198,13 @@ def get_adaptive_corridor_coords(G: nx.MultiDiGraph, orig_pt, dest_pt, is_peak: 
         s = float(data.get('speed_kph', 30.0)) / 3.6
         G_base.add_edge(u, v, length=l, travel_time=l / max(1.0, s))
 
+    # 1. 传统最短路线 (中间直连走廊)
     try:
         r_short = nx.shortest_path(G_base, orig_node, dest_node, weight='length')
     except Exception:
         r_short = [orig_node, dest_node]
 
+    # 2. 时间最快路线 (主干大街走廊)
     G_fast = G_base.copy()
     for u, v in zip(r_short[:-1], r_short[1:]):
         if G_fast.has_edge(u, v):
@@ -207,6 +214,7 @@ def get_adaptive_corridor_coords(G: nx.MultiDiGraph, orig_pt, dest_pt, is_peak: 
     except Exception:
         r_fast = r_short
 
+    # 3. 自适应低碳走廊
     G_eco = G_base.copy()
     if is_peak:
         avoid_edges = set(zip(r_short[:-1], r_short[1:])) | set(zip(r_fast[:-1], r_fast[1:]))
@@ -221,6 +229,7 @@ def get_adaptive_corridor_coords(G: nx.MultiDiGraph, orig_pt, dest_pt, is_peak: 
     else:
         r_eco = r_short
 
+    # 首尾吸附图钉
     coords_short = [orig_pt] + [(G.nodes[n]['y'], G.nodes[n]['x']) for n in r_short] + [dest_pt]
     coords_eco   = [orig_pt] + [(G.nodes[n]['y'], G.nodes[n]['x']) for n in r_eco]   + [dest_pt]
 
@@ -238,6 +247,7 @@ def get_adaptive_corridor_coords(G: nx.MultiDiGraph, orig_pt, dest_pt, is_peak: 
 is_peak_hour = ("高峰" in traffic_mode)
 coords_short, coords_fast, coords_eco, d_short, d_fast, d_eco = get_adaptive_corridor_coords(G, src_pt, dest_pt, is_peak_hour)
 
+# 5. 动力学物理指标响应
 if is_peak_hour:
     co2_short = d_short * 0.65 * 1.45
     co2_fast = d_fast * 0.65 * 1.20
@@ -246,7 +256,7 @@ if is_peak_hour:
     idle_delta = "-72.4%"
     pke_delta = "-38.5%"
     winner_str = "自适应低碳路线"
-    reason_str = "高拥堵碳盲区突破（最短路穿心遇密集灯控排队，平顺走廊大幅降低急启停与怠速）"
+    reason_str = "高拥堵碳盲区突破（最短路中间直穿密集灯控与排队，平顺走廊大幅降低急启停与怠速）"
     td_val = -15.0
 else:
     co2_short = d_short * 0.48 * 1.05
@@ -281,12 +291,14 @@ else:
 energy_rate = max(0.0, (co2_short - co2_eco) / co2_short * 100)
 saving_pct = max(0.0, (co2_short - co2_eco) / co2_short * 100)
 
+# 6. 顶层 Tab 导航
 tab_case, tab_stats, tab_arch = st.tabs([
     "🕹️ 典型场景微观仿真对比", 
     "📊 50 组全场景科研实验统计大屏", 
     "📐 数字孪生系统架构与决策模型"
 ])
 
+# ------------------ TAB 1: 典型案例微观对比 ------------------
 with tab_case:
     col_map, col_metrics = st.columns((3, 2))
 
@@ -405,7 +417,6 @@ with tab_stats:
         st.plotly_chart(fig_bar, use_container_width=True)
 
     with col_chart2:
-        # 【采用字典行记录定义，彻底杜绝语法解析剔除】
         pie_data = pd.DataFrame([
             {"决策类型": "成功识别并突破碳盲区", "数量": 28},
             {"决策类型": "最短路线本身最优无需调整", "数量": 22}
@@ -419,12 +430,7 @@ with tab_stats:
         fig_pie.update_layout(height=320, margin=dict(l=20, r=20, t=40, b=20))
         st.plotly_chart(fig_pie, use_container_width=True)
 
+# ------------------ TAB 3: 系统架构与决策模型 ------------------
 with tab_arch:
     st.subheader("多基线竞争机制与多目标自适应决策模型")
-    st.write("1. 多基线路径竞争机制：系统引入最短距离 Agent (蓝)、时间最优 Agent (橙)、平顺降碳 Agent (绿) 进行多智能体竞争，并由 SUMO+HBEFA 数字孪生闭环进行帕累托多目标仲裁。")
-    st.write("2. 自适应多目标代价函数：")
-    st.latex(r"\min \quad J(R) = \alpha(CI) \cdot E_{\text{CO}_2} + \beta(CI) \cdot T + \gamma \cdot D")
-    st.write("拥堵感知动态映射方程：")
-    st.latex(r"\alpha(CI) = 0.40 + 0.35 \cdot CI, \quad \beta(CI) = 0.40 - 0.25 \cdot CI, \quad \gamma = 0.20")
-    st.write("其中动态拥堵指数 CI 随路网拥堵度动态变化。高峰拥堵期自动放大碳排权重至 0.75，平峰畅通期向效率平缓过渡。同时硬性约束通行时间增加不超过 20%，距离增加不超过 30%。")
-    st.info("终极立论：传统路径规划关注最快到达，碳路智行关注最优抵达。系统通过交通状态感知、微观排放仿真和多目标动态仲裁，实现城市道路效率与低碳目标的协同优化。")
+    st.write("1. 多基线路径竞争
