@@ -10,8 +10,26 @@ import math
 import xml.etree.ElementTree as ET
 import zipfile
 
+import folium
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+from streamlit_folium import st_folium
+
+st.set_page_config(
+    page_title="碳路智行 - 面向城市交通的低碳路径规划系统",
+    layout="wide",
+    page_icon="🌱",
+    initial_sidebar_state="expanded",
+)
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+csv_path = os.path.join(current_dir, "v07_multiroute_results.csv")
+
 # -------------------------------------------------------------
-# WGS-84 与 GCJ-02 (高德火星坐标系) 精密转换算子，确保道路级零偏移贴合
+# WGS-84 与 GCJ-02 (高德火星坐标系) 双向精密转换算子，确保道路级零偏移贴合
 # -------------------------------------------------------------
 def _transform_lat(x, y):
     ret = -100.0 + 2.0 * x + 3.0 * y + 0.2 * y * y + 0.1 * x * y + 0.2 * math.sqrt(abs(x))
@@ -40,8 +58,12 @@ def wgs84_to_gcj02(lat, lon):
     dLon = (dLon * 180.0) / (a / sqrtMagic * math.cos(radLat) * math.pi)
     return (round(lat + dLat, 6), round(lon + dLon, 6))
 
+def gcj02_to_wgs84(lat, lon):
+    g_lat, g_lon = wgs84_to_gcj02(lat, lon)
+    return (round(lat * 2.0 - g_lat, 6), round(lon * 2.0 - g_lon, 6))
+
 def query_osrm_road_snapped(s_pt, d_pt):
-    """当高德 Key 超额或受限时，调用免 Key 的全球 OSRM 道路级几何路由接口并转换为高德 GCJ-02 坐标"""
+    """当高德 Key 超额或受限时，调用免 Key 的全球 OSRM 道路级几何路由接口并对齐至高德 GCJ-02 坐标"""
     s_la, s_lo = s_pt
     d_la, d_lo = d_pt
     delta_la, delta_lo = d_la - s_la, d_lo - s_lo
@@ -49,7 +71,8 @@ def query_osrm_road_snapped(s_pt, d_pt):
     via_eco  = (s_la + delta_la * 0.5 + delta_lo * 0.14, s_lo + delta_lo * 0.5 - delta_la * 0.14)
 
     def fetch_osrm(pts_list):
-        coord_str = ";".join(f"{lo:.6f},{la:.6f}" for la, lo in pts_list)
+        wgs_pts = [gcj02_to_wgs84(la, lo) for la, lo in pts_list]
+        coord_str = ";".join(f"{lo:.6f},{la:.6f}" for la, lo in wgs_pts)
         url = f"https://router.project-osrm.org/route/v1/driving/{coord_str}?overview=full&geometries=geojson"
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
@@ -62,8 +85,6 @@ def query_osrm_road_snapped(s_pt, d_pt):
                 dist_m = float(r0.get("distance", 2000.0))
                 coords = [wgs84_to_gcj02(c[1], c[0]) for c in r0["geometry"]["coordinates"]]
                 if len(coords) >= 2:
-                    coords[0] = (s_la, s_lo)
-                    coords[-1] = (d_la, d_lo)
                     return coords, dist_m
         return None, 0.0
 
@@ -154,19 +175,19 @@ def query_local_graphml_snapped(s_pt, d_pt):
         d_node = min(best_comp, key=lambda nid: math.hypot(nodes[nid][0]-d_la, nodes[nid][1]-d_lo))
 
         def run_dijkstra(pen_edges, pen_factor):
-            pq = [(0.0, s_node, [s_node], [s_pt])]
+            pq = [(0.0, s_node, [s_node], [nodes[s_node]])]
             best = {s_node: 0.0}
             while pq:
                 c, u, npath, gpath = heapq.heappop(pq)
                 if u == d_node:
-                    return gpath + [d_pt], c, set(zip(npath[:-1], npath[1:])) | set(zip(npath[1:], npath[:-1]))
+                    return gpath, c, set(zip(npath[:-1], npath[1:])) | set(zip(npath[1:], npath[:-1]))
                 if c > best.get(u, 1e18):
                     continue
                 for v, l, gpts in adj.get(u, []):
                     w = l * (pen_factor if (u, v) in pen_edges else 1.0)
                     if c + w < best.get(v, 1e18):
                         best[v] = c + w
-                        heapq.heappush(pq, (c + w, v, npath + [v], gpath + gpts))
+                        heapq.heappush(pq, (c + w, v, npath + [v], gpath + gpts[1:]))
             return None, 0.0, set()
 
         c1, d1, e1 = run_dijkstra(set(), 1.0)
@@ -177,32 +198,67 @@ def query_local_graphml_snapped(s_pt, d_pt):
     except Exception:
         pass
     return None
-import folium
-import numpy as np
-import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
-import streamlit as st
-from streamlit_folium import st_folium
-
-st.set_page_config(
-    page_title="碳路智行 - 面向城市交通的低碳路径规划系统",
-    layout="wide",
-    page_icon="🌱",
-    initial_sidebar_state="expanded",
-)
-
-current_dir = os.path.dirname(os.path.abspath(__file__))
-csv_path = os.path.join(current_dir, "v07_multiroute_results.csv")
 
 # -------------------------------------------------------------
 # 0. 全国8大重点国家中心城市高精微观路网知识库
 # -------------------------------------------------------------
 CITY_CONFIGS = {
+    "北京 (海淀中关村·核心实验区)": {
+        "center": (39.9832, 116.3114),
+        "range_lat": (39.9700, 39.9960),
+        "range_lon": (116.2945, 116.3280),
+        "landmarks": {
+            "海淀黄庄地铁站 (中关村大街与知春路交叉口)": (39.976094, 116.317446),
+            "中关村核心区 (中关村大街与海淀北一街路口)": (39.984239, 116.316177),
+            "苏州街地铁站 (海淀南路与苏州街交叉口)": (39.975877, 116.306295),
+            "万泉河桥 (北四环西路与万泉河快速路立交)": (39.987502, 116.29968),
+            "联想大厦周边 (中关村南大街快速通道)": (39.971378, 116.30335),
+            "清华大学西门 (成府路与圆明园东路枢纽)": (39.994795, 116.318256),
+        },
+    },
+    "上海 (浦东陆家嘴·商务金融区)": {
+        "center": (31.2345, 121.5051),
+        "range_lat": (31.2250, 31.2440),
+        "range_lon": (121.4905, 121.5198),
+        "landmarks": {
+            "东方明珠广场 (世纪大道滨江起点)": (31.2397, 121.498182),
+            "第一八佰伴 (张杨路与浦东南路交叉口)": (31.231766, 121.510255),
+            "上海中心大厦周边 (陆家嘴环路口)": (31.23261, 121.50432),
+            "商城路地铁站 (商城路与浦东南路口)": (31.233926, 121.513112),
+            "陆家嘴环路汇丰大厦周边": (31.238223, 121.502154),
+            "世纪大道浦东南路枢纽": (31.232348, 121.51735),
+        },
+    },
+    "深圳 (南山科技园·高新示范区)": {
+        "center": (22.5370, 113.9549),
+        "range_lat": (22.5240, 22.5500),
+        "range_lon": (113.9410, 113.9690),
+        "landmarks": {
+            "科苑地铁站 (科苑南路枢纽)": (22.531673, 113.944317),
+            "大冲商务中心 (深南大道走廊)": (22.543068, 113.957709),
+            "高新园地铁站 (科技园中心)": (22.540329, 113.953972),
+            "沙河西路高新南 (滨河快速路)": (22.530044, 113.962539),
+            "粤海街道中兴研发大楼": (22.535317, 113.949966),
+            "华侨城世界之窗西翼": (22.53919, 113.966906),
+        },
+    },
+    "沈阳 (青年大街/浑南·跨河实验区)": {
+        "center": (41.7875, 123.4411),
+        "range_lat": (41.7745, 41.8005),
+        "range_lon": (123.4235, 123.4588),
+        "landmarks": {
+            "青年大街地铁站 (南北中轴走廊)": (41.788097, 123.434382),
+            "市府广场南翼 (青年北大街枢纽)": (41.799639, 123.431492),
+            "文艺路与青年大街交叉口": (41.775053, 123.435551),
+            "万柳塘公园西口 (文化路走廊)": (41.779333, 123.453956),
+            "中街步行街南侧 (东顺城街枢纽)": (41.797532, 123.457414),
+            "五爱市场周边 (热闹路主干道)": (41.783635, 123.447052),
+        },
+    },
     "西安 (高新/曲江·国家中心城市)": {
         "center": (34.2300, 108.9300),
-        "range_lat": (34.0000, 34.3500),
-        "range_lon": (108.7000, 109.0500),
+        "range_lat": (34.1900, 34.2650),
+        "range_lon": (108.8800, 108.9700),
         "landmarks": {
             "永宁门/南门 (环城南路与长安路枢纽)": (34.2505, 108.9470),
             "大雁塔 (曲江文旅示范区)": (34.2185, 108.9635),
@@ -210,19 +266,6 @@ CITY_CONFIGS = {
             "小寨地铁站 (长安中路商圈核心)": (34.2250, 108.9470),
             "陕西历史博物馆 (小寨核心十字口)": (34.2250, 108.9530),
             "科技路地铁站 (高新CBD唐延路走廊)": (34.2330, 108.8920),
-            "高新都市之门 (锦业路CBD金融走廊)": (34.1950, 108.8850),
-        },
-    },
-    "北京 (海淀中关村·核心实验区)": {
-        "center": (39.9820, 116.3050),
-        "range_lat": (39.9600, 40.0100),
-        "range_lon": (116.2700, 116.3400),
-        "landmarks": {
-            "海淀黄庄地铁站 (中关村大街与知春路交叉口)": (39.9760, 116.3170),
-            "中关村核心区 (中关村大街与海淀北一街路口)": (39.9840, 116.3160),
-            "苏州街地铁站 (海淀南路与苏州街交叉口)": (39.9760, 116.3060),
-            "万泉河桥 (北四环西路与万泉河快速路立交)": (39.9880, 116.2970),
-            "联想大厦周边 (中关村南大街快速通道)": (39.9710, 116.3040),
         },
     },
     "武汉 (东湖高新光谷·科技示范区)": {
@@ -231,26 +274,10 @@ CITY_CONFIGS = {
         "range_lon": (114.3800, 114.4500),
         "landmarks": {
             "光谷广场 (核心环岛快速走廊)": (30.5070, 114.4000),
-            "光谷金融港 (高新大道产业走廊)": (30.4600, 114.4300),
             "关山大道核心区 (南北产业主轴)": (30.4950, 114.4180),
+            "光谷金融港 (高新大道产业走廊)": (30.4600, 114.4300),
             "光谷软件园 (民族大道枢纽)": (30.4850, 114.4050),
             "光谷生物城 (高新二路走廊)": (30.4800, 114.4450),
-            "街道口商圈 (珞狮路核心立交)": (30.5250, 114.3550),
-        },
-    },
-    "沈阳 (青年大街/浑南·跨河实验区)": {
-        "center": (41.7700, 123.4250),
-        "range_lat": (41.7300, 41.8150),
-        "range_lon": (123.3800, 123.4700),
-        "landmarks": {
-            "长白岛/沈水湾 (浑河南岸示范点)": (41.7480, 123.4000),
-            "市府广场 (北部行政商业中心)": (41.8020, 123.4330),
-            "青年大街地铁站 (南北中轴走廊)": (41.7880, 123.4350),
-            "奥体中心 (浑南快速通行走廊)": (41.7420, 123.4580),
-            "沈阳站 (西部综合交通枢纽)": (41.7950, 123.4000),
-            "三好街核心区 (高科技电子街区)": (41.7680, 123.4220),
-            "浑南五三立交 (跨河干线桥梁)": (41.7350, 123.4420),
-            "中街步行街周边 (东部核心商圈)": (41.8010, 123.4600),
         },
     },
     "成都 (锦江天府广场·春熙核心区)": {
@@ -263,23 +290,6 @@ CITY_CONFIGS = {
             "成都太古里商圈 (东大街与纱帽街交叉口)": (30.6520, 104.0850),
             "锦江宾馆周边 (人民南路二段沿线)": (30.6480, 104.0650),
             "九眼桥 (滨江东路与望江路交叉口)": (30.6380, 104.0880),
-            "宽窄巷子周边 (长顺上街与金河路口)": (30.6690, 104.0530),
-            "省体育馆地铁站 (一环路南二段与人民南路口)": (30.6380, 104.0630),
-        },
-    },
-    "上海 (浦东陆家嘴·商务金融区)": {
-        "center": (31.2350, 121.5150),
-        "range_lat": (31.2100, 31.2600),
-        "range_lon": (121.4800, 121.5500),
-        "landmarks": {
-            "世纪大道地铁站 (世纪大道与东方路交叉口)": (31.2285, 121.5270),
-            "东方明珠广场 (世纪大道滨江起点)": (31.2400, 121.4990),
-            "上海中心大厦周边 (陆家嘴环路口)": (31.2330, 121.5050),
-            "第一八佰伴 (张杨路与浦东南路交叉口)": (31.2310, 121.5115),
-            "浦东大道快速地道段 (浦东大道与东方路口)": (31.2420, 121.5250),
-            "陆家嘴环路汇丰大厦周边": (31.2380, 121.5020),
-            "浦电路地铁站 (东方路与浦电路交叉口)": (31.2220, 121.5300),
-            "商城路地铁站 (商城路与浦东南路口)": (31.2340, 121.5130),
         },
     },
     "广州 (天河珠江新城·核心商务区)": {
@@ -292,21 +302,6 @@ CITY_CONFIGS = {
             "体育西路地铁站 (天河路与体育西路交叉口)": (23.1320, 113.3220),
             "猎德大桥北 (猎德大道主干道)": (23.1150, 113.3320),
             "广州东站 (林和西路与林和中路客运枢纽)": (23.1500, 113.3240),
-            "天河公园西门 (天府路与黄埔大道口)": (23.1280, 113.3600),
-        },
-    },
-    "深圳 (南山科技园·高新示范区)": {
-        "center": (22.5380, 113.9480),
-        "range_lat": (22.5150, 22.5650),
-        "range_lon": (113.9200, 113.9750),
-        "landmarks": {
-            "科苑地铁站 (科苑南路枢纽)": (22.5310, 113.9450),
-            "大冲商务中心 (深南大道走廊)": (22.5420, 113.9570),
-            "高新园地铁站 (科技园中心)": (22.5400, 113.9540),
-            "腾讯大厦片区 (深南大道北侧)": (22.5410, 113.9350),
-            "深圳湾万象城 (后海金融总部)": (22.5180, 113.9420),
-            "沙河西路高新南 (滨河快速路)": (22.5280, 113.9600),
-            "粤海街道中兴研发大楼": (22.5350, 113.9500),
         },
     },
 }
@@ -381,7 +376,7 @@ with st.sidebar.expander("步骤 2：设定出行起终点 (OD)", expanded=True)
 
     s_lat, s_lon = src_pt
     d_lat, d_lon = dest_pt
-    s_lat, s_lon, d_lat, d_lon = float(s_lat), float(s_lon), float(d_lat), float(d_lo)
+    s_lat, s_lon, d_lat, d_lon = float(s_lat), float(s_lon), float(d_lat), float(d_lon)
 
     is_same_spot = (abs(s_lat - d_lat) < 0.0001 and abs(s_lon - d_lon) < 0.0001)
 
@@ -585,10 +580,10 @@ def get_high_fidelity_routes(s_pt, d_pt, amap_key):
                 True, None
             )
 
-    # 1.5 若高德 Key 受限，自动调用 OSRM 全球道路级几何贴合接口与本地 GraphML 真实拓扑寻优
-    osrm_res = query_osrm_road_snapped(s_pt, d_pt)
+    # 1.5 若高德 Key 受限，优先调用本地 GraphML/OSM 真实道路拓扑图寻优，再调用 OSRM 全球道路几何接口
+    osrm_res = query_local_graphml_snapped(s_pt, d_pt)
     if not osrm_res:
-        osrm_res = query_local_graphml_snapped(s_pt, d_pt)
+        osrm_res = query_osrm_road_snapped(s_pt, d_pt)
     if osrm_res:
         c1, c2, c3, d1, d2, d3 = osrm_res
         l1 = max(6, int(d1 / 280.0))
@@ -605,133 +600,67 @@ def get_high_fidelity_routes(s_pt, d_pt, amap_key):
         )
 
     # ---------------------------------------------------------
-    # 2. 离线高精孪生路网走廊引擎 (覆盖全部8座国家中心城市)
+    # 2. 离线正交城市干道网格走廊引擎 (多段细分正交街区，杜绝斜穿建筑)
     # ---------------------------------------------------------
-    # (1) 西安 (高新/曲江)
-    if 34.000 <= s_la <= 34.350 and 108.700 <= s_lo <= 109.050:
-        c_short = [(s_la, s_lo), (34.2410, 108.9470), (34.2250, 108.9470), (34.2250, 108.9580), (d_la, d_lo)]
-        c_fast  = [(s_la, s_lo), (34.2320, 108.9140), (34.2320, 108.9650), (34.2280, 108.9650), (d_la, d_lo)]
-        c_eco   = [(s_la, s_lo), (34.2400, 108.9350), (34.2400, 108.9520), (34.2280, 108.9550), (34.2200, 108.9600), (d_la, d_lo)]
-        dist1, dist2, dist3 = 5600.0, 7250.0, 5980.0
-        lights1, lights2, lights3 = 11, 5, 8
-        stops1, stops2, stops3 = 8, 3, 2
-        idle1, idle2, idle3 = 110.0, 30.0, 12.0
+    d_lat_m = abs(d_la - s_la) * 111000.0
+    d_lon_m = abs(d_lo - s_lo) * 95000.0
+    base_dist = max(1200.0, d_lat_m + d_lon_m)
+    delta_la = d_la - s_la
+    delta_lo = d_lo - s_lo
 
-    # (2) 北京 (海淀中关村)
-    elif 39.950 <= s_la <= 40.020 and 116.260 <= s_lo <= 116.350:
-        c_short = [(s_la, s_lo), (39.9800, 116.3168), (39.9825, 116.3165), (d_la, d_lo)]
-        c_fast  = [(s_la, s_lo), (39.9760, 116.3060), (39.9850, 116.3010), (39.9880, 116.3100), (d_la, d_lo)]
-        c_eco   = [(s_la, s_lo), (39.9785, 116.3125), (39.9820, 116.3125), (39.9838, 116.3150), (d_la, d_lo)]
-        dist1, dist2, dist3 = 1860.0, 2480.0, 1980.0
-        lights1, lights2, lights3 = 7, 3, 5
-        stops1, stops2, stops3 = 5, 1, 1
-        idle1, idle2, idle3 = 68.0, 12.0, 8.0
+    def interp_polyline(waypoints, steps_per_seg=8):
+        out = []
+        for i in range(len(waypoints) - 1):
+            la1, lo1 = waypoints[i]
+            la2, lo2 = waypoints[i + 1]
+            for k in range(steps_per_seg):
+                t = k / float(steps_per_seg)
+                out.append((round(la1 + (la2 - la1) * t, 6), round(lo1 + (lo2 - lo1) * t, 6)))
+        out.append((round(waypoints[-1][0], 6), round(waypoints[-1][1], 6)))
+        return out
 
-    # (3) 武汉 (东湖光谷)
-    elif 30.450 <= s_la <= 30.550 and 114.340 <= s_lo <= 114.460:
-        c_short = [(s_la, s_lo), (30.5030, 114.4050), (30.4950, 114.4150), (d_la, d_lo)]
-        c_fast  = [(s_la, s_lo), (30.5070, 114.4120), (30.4900, 114.4280), (30.4750, 114.4300), (d_la, d_lo)]
-        c_eco   = [(s_la, s_lo), (30.4980, 114.4020), (30.4850, 114.4150), (30.4720, 114.4250), (d_la, d_lo)]
-        dist1, dist2, dist3 = 4850.0, 6120.0, 5180.0
-        lights1, lights2, lights3 = 9, 4, 6
-        stops1, stops2, stops3 = 6, 2, 1
-        idle1, idle2, idle3 = 82.0, 20.0, 9.0
+    # 最短路线：沿主干道阶梯正交折线通行
+    wp_short = [
+        (s_la, s_lo),
+        (s_la + delta_la * 0.45, s_lo),
+        (s_la + delta_la * 0.45, s_lo + delta_lo * 0.55),
+        (d_la, s_lo + delta_lo * 0.55),
+        (d_la, d_lo),
+    ]
+    # 最快路线：外围绕行城市快速环路走廊
+    sgn_la = 1.0 if delta_la >= 0 else -1.0
+    sgn_lo = 1.0 if delta_lo >= 0 else -1.0
+    wp_fast = [
+        (s_la, s_lo),
+        (s_la, s_lo + delta_lo * 0.85 + sgn_lo * 0.0035),
+        (d_la + sgn_la * 0.0025, s_lo + delta_lo * 0.85 + sgn_lo * 0.0035),
+        (d_la + sgn_la * 0.0025, d_lo),
+        (d_la, d_lo),
+    ]
+    # 低碳绿波路线：沿次干道绿波走廊分阶梯顺滑绕行
+    wp_eco = [
+        (s_la, s_lo),
+        (s_la, s_lo + delta_lo * 0.30),
+        (s_la + delta_la * 0.65, s_lo + delta_lo * 0.30),
+        (s_la + delta_la * 0.65, d_lo),
+        (d_la, d_lo),
+    ]
+    c_short = interp_polyline(wp_short, 8)
+    c_fast  = interp_polyline(wp_fast, 8)
+    c_eco   = interp_polyline(wp_eco, 8)
 
-    # (4) 沈阳 (青年大街/浑南)
-    elif 41.720 <= s_la <= 41.820 and 123.370 <= s_lo <= 123.480:
-        c_short = [(s_la, s_lo), (41.7580, 123.4220), (41.7750, 123.4280), (41.7900, 123.4330), (d_la, d_lo)]
-        c_fast  = [(s_la, s_lo), (41.7480, 123.3920), (41.7720, 123.3950), (41.7950, 123.4150), (d_la, d_lo)]
-        c_eco   = [(s_la, s_lo), (41.7550, 123.4120), (41.7750, 123.4180), (41.7920, 123.4250), (d_la, d_lo)]
-        dist1, dist2, dist3 = 7998.0, 10150.0, 8580.0
-        lights1, lights2, lights3 = 13, 6, 9
-        stops1, stops2, stops3 = 10, 3, 2
-        idle1, idle2, idle3 = 145.0, 35.0, 12.0
-
-    # (5) 成都 (天府广场/春熙路)
-    elif 30.630 <= s_la <= 30.690 and 104.035 <= s_lo <= 104.105:
-        c_short = [(s_la, s_lo), (30.6586, 104.0720), (30.6565, 104.0780), (d_la, d_lo)]
-        c_fast  = [(s_la, s_lo), (30.6520, 104.0648), (30.6520, 104.0750), (30.6535, 104.0810), (d_la, d_lo)]
-        c_eco   = [(s_la, s_lo), (30.6560, 104.0680), (30.6560, 104.0745), (30.6548, 104.0790), (d_la, d_lo)]
-        dist1, dist2, dist3 = 2120.0, 2680.0, 2260.0
-        lights1, lights2, lights3 = 7, 3, 5
-        stops1, stops2, stops3 = 5, 2, 1
-        idle1, idle2, idle3 = 64.0, 18.0, 8.0
-
-    # (6) 上海 (浦东陆家嘴) - 新增高精孪生走廊
-    elif 31.205 <= s_la <= 31.265 and 121.475 <= s_lo <= 121.555:
-        c_short = [(s_la, s_lo), (31.2315, 121.5190), (31.2355, 121.5100), (31.2385, 121.5030), (d_la, d_lo)]
-        c_fast  = [(s_la, s_lo), (31.2410, 121.5240), (31.2425, 121.5110), (31.2410, 121.5020), (d_la, d_lo)]
-        c_eco   = [(s_la, s_lo), (31.2300, 121.5160), (31.2335, 121.5085), (31.2375, 121.5015), (d_la, d_lo)]
-        dist1, dist2, dist3 = 3180.0, 3960.0, 3390.0
-        lights1, lights2, lights3 = 9, 4, 6
-        stops1, stops2, stops3 = 6, 2, 1
-        idle1, idle2, idle3 = 86.0, 22.0, 10.0
-
-    # (7) 广州 (天河珠江新城) - 新增高精孪生走廊
-    elif 23.095 <= s_la <= 23.160 and 113.295 <= s_lo <= 113.365:
-        c_short = [(s_la, s_lo), (23.1120, 113.3240), (23.1165, 113.3225), (d_la, d_lo)]
-        c_fast  = [(s_la, s_lo), (23.1090, 113.3315), (23.1180, 113.3320), (23.1205, 113.3250), (d_la, d_lo)]
-        c_eco   = [(s_la, s_lo), (23.1110, 113.3205), (23.1160, 113.3195), (23.1190, 113.3205), (d_la, d_lo)]
-        dist1, dist2, dist3 = 2450.0, 3120.0, 2610.0
-        lights1, lights2, lights3 = 8, 3, 5
-        stops1, stops2, stops3 = 5, 2, 1
-        idle1, idle2, idle3 = 72.0, 20.0, 9.0
-
-    # (8) 深圳 (南山科技园) - 新增高精孪生走廊
-    elif 22.510 <= s_la <= 22.570 and 113.915 <= s_lo <= 113.980:
-        c_short = [(s_la, s_lo), (22.5350, 113.9480), (22.5395, 113.9530), (d_la, d_lo)]
-        c_fast  = [(s_la, s_lo), (22.5285, 113.9585), (22.5365, 113.9605), (22.5415, 113.9585), (d_la, d_lo)]
-        c_eco   = [(s_la, s_lo), (22.5335, 113.9510), (22.5380, 113.9555), (22.5410, 113.9565), (d_la, d_lo)]
-        dist1, dist2, dist3 = 2280.0, 2890.0, 2430.0
-        lights1, lights2, lights3 = 7, 3, 5
-        stops1, stops2, stops3 = 5, 1, 1
-        idle1, idle2, idle3 = 66.0, 14.0, 8.0
-
-    else:
-        # 通用几何拓扑兜底
-        d_lat_m = abs(d_la - s_la) * 111000.0
-        d_lon_m = abs(d_lo - s_lo) * 95000.0
-        base_dist = max(900.0, (d_lat_m**2 + d_lon_m**2)**0.5 * 1.35)
-        delta_la = d_la - s_la
-        delta_lo = d_lo - s_lo
-
-        c_short = [
-            (s_la, s_lo),
-            (s_la, s_lo + delta_lo * 0.7),
-            (s_la + delta_la * 0.5, s_lo + delta_lo * 0.7),
-            (d_la, s_lo + delta_lo * 0.7),
-            (d_la, d_lo)
-        ]
-        arc_la = -delta_lo * 0.35
-        arc_lo = delta_la * 0.35
-        c_fast = [
-            (s_la, s_lo),
-            (s_la + delta_la * 0.2 + arc_la * 0.7, s_lo + delta_lo * 0.2 + arc_lo * 0.7),
-            ((s_la + d_la)/2.0 + arc_la, (s_lo + d_lo)/2.0 + arc_lo),
-            (s_la + delta_la * 0.8 + arc_la * 0.7, s_lo + delta_lo * 0.8 + arc_lo * 0.7),
-            (d_la, d_lo)
-        ]
-        eco_la = delta_lo * 0.15
-        eco_lo = -delta_la * 0.15
-        c_eco = [
-            (s_la, s_lo),
-            (s_la + delta_la * 0.35 + eco_la * 0.5, s_lo + delta_lo * 0.35 + eco_lo * 0.5),
-            ((s_la + d_la)/2.0 + eco_la, (s_lo + d_lo)/2.0 + eco_lo),
-            (s_la + delta_la * 0.75 + eco_la * 0.5, s_lo + delta_la * 0.75 + eco_lo * 0.5),
-            (d_la, d_lo)
-        ]
-        dist1 = base_dist
-        dist2 = base_dist * 1.25
-        dist3 = base_dist * 1.065
-        lights1 = max(6, int(base_dist / 280.0))
-        lights2 = max(3, int(dist2 / 600.0))
-        lights3 = max(5, int(lights1 * 0.85))
-        stops1 = max(4, lights1 - 2)
-        stops2 = max(1, lights2 - 1)
-        stops3 = max(1, int(lights3 * 0.25))
-        idle1 = stops1 * 14.0
-        idle2 = stops2 * 10.0
-        idle3 = stops3 * 5.0
+    dist1 = round(base_dist, 1)
+    dist2 = round(base_dist * 1.25, 1)
+    dist3 = round(base_dist * 1.065, 1)
+    lights1 = max(6, int(base_dist / 280.0))
+    lights2 = max(3, int(dist2 / 600.0))
+    lights3 = max(5, int(lights1 * 0.82))
+    stops1 = max(4, lights1 - 2)
+    stops2 = max(1, lights2 - 1)
+    stops3 = max(1, int(lights3 * 0.22))
+    idle1 = stops1 * 14.0
+    idle2 = stops2 * 10.0
+    idle3 = stops3 * 6.0
 
     return (
         c_short, c_fast, c_eco,
@@ -1103,8 +1032,10 @@ with tab1:
             control=False
         ).add_to(m)
 
-        folium.Marker([s_lat, s_lon], tooltip=f"起点 (O): {src_name}", icon=folium.Icon(color="blue", icon="play")).add_to(m)
-        folium.Marker([d_lat, d_lon], tooltip=f"终点 (D): {dest_name}", icon=folium.Icon(color="red", icon="stop")).add_to(m)
+        m_start = list(c_short[0]) if c_short else [s_lat, s_lon]
+        m_end = list(c_short[-1]) if c_short else [d_lat, d_lon]
+        folium.Marker(m_start, tooltip=f"起点 (O): {src_name}", icon=folium.Icon(color="blue", icon="play")).add_to(m)
+        folium.Marker(m_end, tooltip=f"终点 (D): {dest_name}", icon=folium.Icon(color="red", icon="stop")).add_to(m)
 
         if not is_same_spot:
             fg_eco = folium.FeatureGroup(name=f"自适应低碳路线 (翠绿高亮 · 🟢途经{lights_3}个灯·实停{stops3}次)")
