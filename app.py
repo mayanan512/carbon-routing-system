@@ -871,7 +871,9 @@ else:
 
 
 def norm(v, min_v, max_v):
-    return (v - min_v) / max(0.0001, (max_v - min_v)) if max_v > min_v else 0.5
+    # 引入最小有效极差阈值 Δ_min (基准值的 5% 阻尼平滑)，防止三候选路线指标相近时微弱差异被放大
+    delta_min = max(0.0001, 0.05 * abs(min_v))
+    return (v - min_v) / max(delta_min, (max_v - min_v)) if max_v > min_v else 0.0
 
 
 d_vals = [d1, d2, d3]
